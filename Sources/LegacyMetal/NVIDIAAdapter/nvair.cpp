@@ -550,6 +550,43 @@ static unsigned clampSampleBias(LLVMModuleRef module, Gen &g) {
     return fixed;
 }
 
+// ---- fast pow of a negative base ------------------------------------------------------------------------------------
+// The plugin's fast pow and powr (air.fast_pow / air.fast_powr: Metal's pow / powr under fast math, the default, which
+// MoltenVK and most apps use; SPIRV-Cross writes GLSL's pow as powr) are exp2(y * log2(x)), NaN for every x < 0, where
+// other Macs' GPUs give |x|^y (Intel's: never NaN, for any exponent): RetroArch's bicubic shaders, whose weights are
+// pow(x, 2.0) of negative distances, drew black, as did yee64, and gamma curves (pow(c, 2.2)) of values a filter took
+// slightly below 0 gave NaN pixels. Each fast pow / powr call takes |x|, as Intel's does (MSL leaves x < 0 undefined
+// there); precise pow and powr keep their own handling.
+// NVAIR_POW_SIGN_FIX. (n55)
+static unsigned fixNegativePowBases(LLVMModuleRef module, Gen &g) {
+    LLVMTypeRef f32 = LLVMFloatTypeInContext(g.context);
+    unsigned fixed = 0;
+    LLVMBuilderRef b = nullptr;
+    for (LLVMValueRef f = LLVMGetFirstFunction(module); f; f = LLVMGetNextFunction(f)) {
+        const char *name = LLVMGetValueName(f);
+        if ((!startsWith(name, "air.fast_pow.") && !startsWith(name, "air.fast_powr.")) || !strstr(name, "f32")) continue;  // .f32, .v2f32, ...
+        for (LLVMValueRef call : callsTo(f)) {
+            if (LLVMGetNumArgOperands(call) != 2) continue;
+            LLVMValueRef x = LLVMGetOperand(call, 0);
+            if (LLVMIsAInstruction(x) && startsWith(LLVMGetValueName(x), "nvair.pow")) continue;  // an earlier run's
+            LLVMTypeRef type = LLVMTypeOf(x);
+            bool vector = LLVMGetTypeKind(type) == LLVMVectorTypeKind;
+            unsigned lanes = vector ? LLVMGetVectorSize(type) : 1;
+            if ((vector ? LLVMGetElementType(type) : type) != f32 || lanes > 16) continue;
+            LLVMValueRef magnitude[16];
+            for (unsigned k = 0; k < lanes; k++) magnitude[k] = g.c32(0x7fffffff);
+            LLVMTypeRef bits = vector ? LLVMVectorType(g.i32, lanes) : g.i32;
+            if (!b) b = LLVMCreateBuilderInContext(g.context);
+            LLVMPositionBuilderBefore(b, call);
+            LLVMValueRef cleared = LLVMBuildAnd(b, LLVMBuildBitCast(b, x, bits, ""), vector ? LLVMConstVector(magnitude, lanes) : magnitude[0], "");
+            LLVMSetOperand(call, 0, LLVMBuildBitCast(b, cleared, type, "nvair.pow.abs"));  // the sign bit cleared: |x|
+            fixed++;
+        }
+    }
+    if (b) LLVMDisposeBuilder(b);
+    return fixed;
+}
+
 // ---- cube reads at a level ------------------------------------------------------------------------------------------
 // read() of a cube (array) at a level above 0 read level 0: the plugin's body samples along the texel's direction from
 // level 0's size with a built-in sampler without mip filter and with LOD clamp 0. Each such body gets the level's size
@@ -2669,6 +2706,7 @@ static const ModuleFix kModuleFixes[] = {
     {"NVAIR_CUBE_READ_LEVEL", fixCubeReadLevels, "[nvair] %u cube read body(ies) given the level's size and a mip-filtered sampler\n", false},
     {"NVAIR_ARRAY_LAYER_CLAMP", clampArrayLayers, "[nvair] %u texture-array layer(s) clamped at 0\n", false},
     {"NVAIR_BIAS_CLAMP", clampSampleBias, "[nvair] %u sample bias(es) clamped to [-16, 15.99]\n", false},
+    {"NVAIR_POW_SIGN_FIX", fixNegativePowBases, "[nvair] %u fast pow / powr call(s) given |x|\n", false},
     {"NVAIR_LOCAL_CMPXCHG", fixLocalCompareExchange, "[nvair] %u threadgroup compare-exchange body(ies) given the store of the value found\n", false},
     {"NVAIR_SIGNED_BOOL_FIX", fixSignedBoolConversions, "[nvair] %u sign mask(s) taken out of signed-to-bool conversions\n", false},
     {"NVAIR_ATOMIC_JOIN_FIX", fixAtomicJoinOperands, "[nvair] %u atomic operand(s) from a branch join put through a private slot\n", false},
