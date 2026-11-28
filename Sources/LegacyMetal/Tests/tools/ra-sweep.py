@@ -6,7 +6,8 @@
 # records per preset: ok (applied, still alive, output not blank), error (RetroArch or MoltenVK logged an error and kept
 # its old shader), timeout (no "Applying shader" within --timeout s), blank (the window's picture is ~all black), died
 # (RetroArch quit; a crash report is named), devlost (MoltenVK / Metal lost the device). RetroArch restarts after a death
-# or device loss; RetroArch's on-screen messages are off (a notification over a black picture passed the blank check). Results: DIR/results.tsv (index, status, seconds, preset, detail), the log per RetroArch run, small
+# or device loss; the shot waits until RetroArch's main loop answers again (it builds the preset's pipelines there after
+# logging "Applying shader"); RetroArch's on-screen messages are off (a notification over a black picture passed the blank check). Results: DIR/results.tsv (index, status, seconds, preset, detail), the log per RetroArch run, small
 # screenshots of non-ok presets. Throwaway HOME; the app's Metal shader cache is cleared at the start.
 import argparse, faulthandler, glob, os, re, shutil, signal, socket, subprocess, sys, time
 faulthandler.register(signal.SIGUSR1, all_threads=True)  # kill -USR1 <pid>: where a stalled sweep is
@@ -89,6 +90,15 @@ def shot(name):
         st = ImageStat.Stat(im); return st.mean[0], st.stddev[0], path
     except Exception: return None
 
+def main_loop_answers(limit):  # RetroArch builds the preset's pipelines in its main loop after "Applying shader": a command
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); probe.settimeout(1.0)  # answered after it means the new preset draws
+    t0 = time.time()
+    while time.time() - t0 < limit and proc.poll() is None:
+        probe.sendto(b'VERSION', ('127.0.0.1', a.port))
+        try: probe.recv(512); return True
+        except socket.timeout: pass
+    return False
+
 res = open(out + '/results.tsv', 'a')
 start()
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -108,6 +118,8 @@ for i, p in enumerate(presets, a.start):
         if any(re.search(r'Invalid Resource|DEVICE_LOST|device was lost', l) for l in errs): status, detail = 'devlost', errs[0][:200]; break
         if errs: status, detail = 'error', errs[0][:200]; break
         if 'Applying shader' in new: status = 'ok'; break
+    if status == 'ok' and not main_loop_answers(a.timeout):  # else a slow build's shot shows the previous preset
+        status, detail = ('died', '') if proc.poll() is not None else ('timeout', 'building its pipelines')
     secs = time.time() - t0
     if status == 'ok':
         time.sleep(a.settle)
