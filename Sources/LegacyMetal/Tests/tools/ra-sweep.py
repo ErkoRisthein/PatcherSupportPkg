@@ -6,7 +6,7 @@
 # records per preset: ok (applied, still alive, output not blank), error (RetroArch or MoltenVK logged an error and kept
 # its old shader), timeout (no "Applying shader" within --timeout s), blank (the window's picture is ~all black), died
 # (RetroArch quit; a crash report is named), devlost (MoltenVK / Metal lost the device). RetroArch restarts after a death
-# or device loss. Results: DIR/results.tsv (index, status, seconds, preset, detail), the log per RetroArch run, small
+# or device loss; RetroArch's on-screen messages are off (a notification over a black picture passed the blank check). Results: DIR/results.tsv (index, status, seconds, preset, detail), the log per RetroArch run, small
 # screenshots of non-ok presets. Throwaway HOME; the app's Metal shader cache is cleared at the start.
 import argparse, faulthandler, glob, os, re, shutil, signal, socket, subprocess, sys, time
 faulthandler.register(signal.SIGUSR1, all_threads=True)  # kill -USR1 <pid>: where a stalled sweep is
@@ -44,7 +44,9 @@ def start():
         f.write(f'video_driver = "{a.driver}"\nlibretro_directory = "{X}"\nvideo_shader_dir = "{X}/shaders_slang"\n'
                 f'video_shader_enable = "true"\nnetwork_cmd_enable = "true"\nnetwork_cmd_port = "{a.port}"\npause_nonactive = "false"\n'
                 'audio_driver = "null"\nvideo_fullscreen = "false"\nlog_verbosity = "true"\nconfig_save_on_exit = "false"\n'
-                'video_shader_preset_save_reference_enable = "false"\nauto_shaders_enable = "false"\n' + ''.join(l.strip() + '\n' for l in a.cfg.split(';') if l.strip()))
+                'video_shader_preset_save_reference_enable = "false"\nauto_shaders_enable = "false"\n'
+                'video_font_enable = "false"\nmenu_enable_widgets = "false"\n'  # no on-screen messages: they hid black pictures from the blank check
+                + ''.join(l.strip() + '\n' for l in a.cfg.split(';') if l.strip()))
     logpath = f'{out}/log-{run}.txt'; logf = open(logpath, 'w')
     subprocess.run([CW, 'start', f'{out}/mark-{run}'])
     env = dict(os.environ, HOME=home, CFFIXED_USER_HOME=home)
