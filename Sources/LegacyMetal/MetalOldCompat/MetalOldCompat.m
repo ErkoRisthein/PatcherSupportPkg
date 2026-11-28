@@ -4554,58 +4554,72 @@ static void retainingCommandBuffers(void) {
 // 88. Kepler: swizzled texture views. MoltenVK 1.4 makes every VkImageView with a component swizzle through that method
 // and never checks for nil: Godot's L8 / LA8 textures (its font glyphs among them) are R8 / RG8 with RRR1 / RRRG, and
 // item 54's nil read as zero, so Godot drew no text. The hardware swizzles in the texture header: word 0's X/Y/Z/W
-// sources at bits 18/21/24/27 (0 zero, 2-5 R/G/B/A, 6 / 7 one as integer / float). GeForceMTLDriver writes a texture's
-// header when the texture is made, from a per-format table (24-byte entries, word 0 at +16), at the index its driver
-// object keeps (MTLIOAccelResource _res.vendor[0]: +0x194 the index, +0x130 the header it wrote); editing either
-// afterwards changes nothing, as the header has already gone to the GPU. So the view is made plain while the format's
-// table entry holds the swizzled sources, under a lock, and the entry is put back at once. The table is found from the
-// one place that reads it (mov 0x194(%rbx), %edi; ...; lea (%rdi,%rdi,2), %rax; lea table(%rip), %rcx; mov
-// 0x10(%rcx,%rax,8), %rsi), and the entry must equal the header a plain view of that format got; anything else, or
-// depth / stencil, stays nil as before. Another thread making a texture of the same format in those microseconds would
-// get the swizzle too: apps make swizzled views while setting up textures, not per draw. Only the entry's page is made
-// writable (a private copy), and only if no code shares the table's pages; it is left readable, not executable.
-// MTLSHIM_NV_SWIZZLE_VIEWS=0: nil, as item 54. Test: s91.
-static uint8_t *nvHeaderTable;  // item 88
-static size_t nvHeaderTableSize;
+// sources at bits 18/21/24/27 (0 zero, 2-5 R/G/B/A, 6 / 7 one as integer / float). GeForceMTLDriver keeps a texture's
+// header in its driver object (MTLIOAccelResource _res.vendor[0], +0x130), written from a per-format table by a C++
+// virtual method when the texture is made and sent to the GPU after that method returns; editing it any later changes
+// nothing. So that method's vtable slot is wrapped: while a thread makes a swizzled view (as a plain view), the new
+// object's header word 0 gets the swizzled sources right after the driver wrote it. Nothing shared changes, so other
+// threads' textures of the same format stay plain (an earlier version swapped the format's table entry for that moment,
+// which they read too: n54). The method is found from its table read (mov 0x194(%rbx), %edi; ...; lea (%rdi,%rdi,2),
+// %rax; lea table(%rip), %rcx; mov 0x10(%rcx,%rax,8), %rdx), which must be the only one, as must the vtable slot that
+// points at it; anything else, depth / stencil, or a view whose header wasn't edited stays nil as before.
+// MTLSHIM_NV_SWIZZLE_VIEWS=0: nil, as item 54. Tests: s91, n54.
+typedef void (*NVHeaderWriteIMP)(void *, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t);
+static NVHeaderWriteIMP origNVHeaderWrite;  // item 88
 static ptrdiff_t nvResourceOffset = -1;  // MTLIOAccelResource _res, whose first word is the driver's object
-static void keplerHeaderTable(Dl_info *driver) {
+static __thread struct { uint32_t header, word; BOOL pending; } nvPendingSwizzle;  // this thread's swizzled view being made
+static void nvHeaderWrite(void *object, uintptr_t a, uintptr_t b, uintptr_t c, uintptr_t d, uintptr_t e) {
+    origNVHeaderWrite(object, a, b, c, d, e);  // the method takes only the object; the rest passes through untouched
+    uint32_t *word0 = (uint32_t *)((uint8_t *)object + 0x130);
+    if (nvPendingSwizzle.pending && *word0 == nvPendingSwizzle.header) {
+        *word0 = nvPendingSwizzle.word;
+        nvPendingSwizzle.pending = NO;
+    }
+}
+static void keplerHeaderWriter(Dl_info *driver) {
     static const unsigned char kLoadIndex[6] = {0x8b, 0xbb, 0x94, 0x01, 0x00, 0x00};  // mov 0x194(%rbx), %edi
-    static const unsigned char kHead[7] = {0x48, 0x8d, 0x04, 0x7f, 0x48, 0x8d, 0x0d}, kTail[5] = {0x48, 0x8b, 0x74, 0xc1, 0x10};
+    static const unsigned char kHead[7] = {0x48, 0x8d, 0x04, 0x7f, 0x48, 0x8d, 0x0d}, kTail[5] = {0x48, 0x8b, 0x54, 0xc1, 0x10};
+    static const unsigned char kPrologue[4] = {0x55, 0x48, 0x89, 0xe5};  // push %rbp; mov %rsp, %rbp
     Ivar res = class_getInstanceVariable(objc_getClass("MTLIOAccelResource"), "_res");
     const char *resType = res ? ivar_getTypeEncoding(res) : NULL;
     static const char kResType[] = "{_MTLIOAccelResource=\"vendor\"";  // the driver's object is the vendor area's first word
     if (!resType || strncmp(resType, kResType, sizeof kResType - 1)) return;
-    unsigned long textSize = 0, constSize = 0;
-    const unsigned char *text = getsectiondata((const struct mach_header_64 *)driver->dli_fbase, "__TEXT", "__text", &textSize);
-    const unsigned char *consts = getsectiondata((const struct mach_header_64 *)driver->dli_fbase, "__TEXT", "__const", &constSize);
-    const unsigned char *table = NULL;
-    for (unsigned long i = 0x80; text && consts && i + 16 <= textSize; i++) {
+    const struct mach_header_64 *header = (const struct mach_header_64 *)driver->dli_fbase;
+    unsigned long textSize = 0, constSize = 0, dataSize = 0;
+    const unsigned char *text = getsectiondata(header, "__TEXT", "__text", &textSize);
+    const unsigned char *consts = getsectiondata(header, "__TEXT", "__const", &constSize);
+    uintptr_t *data = (uintptr_t *)getsectiondata(header, "__DATA", "__const", &dataSize);  // the vtables
+    const unsigned char *method = NULL;
+    for (unsigned long i = 0x100; text && consts && data && i + 16 <= textSize; i++) {
         if (memcmp(text + i, kHead, 7) || memcmp(text + i + 11, kTail, 5)) continue;
-        BOOL loadsIndex = NO;
-        for (unsigned long k = i - 0x80; !loadsIndex && k < i; k++) loadsIndex = !memcmp(text + k, kLoadIndex, 6);
         int32_t displacement;
         memcpy(&displacement, text + i + 7, 4);
-        if (table || !loadsIndex) return;  // a second site, or not the one we know: another driver build
-        table = text + i + 11 + displacement;
+        const unsigned char *table = text + i + 11 + displacement;
+        BOOL loadsIndex = NO;
+        for (unsigned long k = i - 0x80; !loadsIndex && k < i; k++) loadsIndex = !memcmp(text + k, kLoadIndex, 6);
+        if (method || !loadsIndex || table < consts || table >= consts + constSize) return;  // a second site, or not the one we know
+        for (unsigned long k = i - 4; !method && k > i - 0x100; k--)
+            if (!memcmp(text + k, kPrologue, 4)) method = text + k;  // the nearest function start before it
+        if (!method) return;
     }
-    if (!table || table < consts || table >= consts + constSize) return;
-    // the pages it spans must hold no code: they are written through private copies, never executable again afterwards
-    uintptr_t first = (uintptr_t)table & ~(uintptr_t)(vm_page_size - 1), end = (uintptr_t)(consts + constSize);
-    const struct mach_header_64 *header = (const struct mach_header_64 *)driver->dli_fbase;
-    const struct load_command *command = (const struct load_command *)(header + 1);
-    for (uint32_t c = 0; c < header->ncmds; c++, command = (const struct load_command *)((const char *)command + command->cmdsize)) {
-        if (command->cmd != LC_SEGMENT_64) continue;
-        const struct segment_command_64 *segment = (const struct segment_command_64 *)command;
-        const struct section_64 *section = (const struct section_64 *)(segment + 1);
-        for (uint32_t k = 0; k < segment->nsects; k++, section++) {
-            if (!(section->flags & (S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS))) continue;
-            unsigned long size = 0;
-            uintptr_t code = (uintptr_t)getsectiondata(header, section->segname, section->sectname, &size);
-            if (code && code < end && code + size > first) return;
+    uintptr_t *slot = NULL;
+    for (unsigned long k = 0; method && k < dataSize / sizeof *data; k++)
+        if (data[k] == (uintptr_t)method) {
+            if (slot) return;  // two slots: not the layout we know
+            slot = data + k;
         }
-    }
-    nvHeaderTable = (uint8_t *)table;
-    nvHeaderTableSize = (size_t)(consts + constSize - table);
+    if (!slot) return;  // no slot (or a false function start): leave it
+    vm_address_t region = (vm_address_t)slot, page = region & ~(vm_address_t)(vm_page_size - 1);
+    vm_size_t regionSize = 0;
+    vm_region_basic_info_data_64_t info;
+    mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+    mach_port_t object = MACH_PORT_NULL;
+    if (vm_region_64(mach_task_self(), &region, &regionSize, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info, &count, &object) != KERN_SUCCESS) return;
+    BOOL writable = (info.protection & VM_PROT_WRITE) != 0;
+    if (!writable && vm_protect(mach_task_self(), page, vm_page_size, FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY) != KERN_SUCCESS) return;
+    origNVHeaderWrite = (NVHeaderWriteIMP)*slot;
+    __atomic_store_n(slot, (uintptr_t)nvHeaderWrite, __ATOMIC_RELEASE);  // one aligned store: a thread calling it now gets either
+    if (!writable) vm_protect(mach_task_self(), page, vm_page_size, FALSE, info.protection);
     nvResourceOffset = ivar_getOffset(res);
 }
 static const uint8_t *nvDriverObject(id texture) {
@@ -4640,28 +4654,16 @@ static id nvSwizzledView(id self, MTLPixelFormat format, MTLTextureType type, NS
     id probe = ((NewViewRangeIMP)objc_msgSend)(self, plain, format, type, levels, slices);  // the header this format gets
     const uint8_t *object = nvDriverObject(probe);
     if (!object) return nil;
-    uint32_t index = *(const uint32_t *)(object + 0x194), header = *(const uint32_t *)(object + 0x130);
-    if ((size_t)index * 24 + 20 > nvHeaderTableSize) return nil;
-    uint32_t *entry = (uint32_t *)(nvHeaderTable + (size_t)index * 24 + 16);
-    if (*entry != header) {
-        if (verbose()) shimLog("[mtlshim] swizzled texture view on Kepler: table entry %u is %08x, the header %08x: nil\n", index, *entry, header);
-        return nil;
-    }
-    uint32_t word = swizzledHeaderWord(header, swizzle, integerFormat(format));
-    static os_unfair_lock lock = OS_UNFAIR_LOCK_INIT;
-    vm_address_t page = (vm_address_t)entry & ~(vm_address_t)(vm_page_size - 1);
-    id view = nil;
-    os_unfair_lock_lock(&lock);
-    if (vm_protect(mach_task_self(), page, vm_page_size, FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY) == KERN_SUCCESS) {
-        *entry = word;
-        view = ((NewViewRangeIMP)objc_msgSend)(self, plain, format, type, levels, slices);
-        *entry = header;
-        vm_protect(mach_task_self(), page, vm_page_size, FALSE, VM_PROT_READ);  // data only (keplerHeaderTable checked)
-    }
-    os_unfair_lock_unlock(&lock);
+    uint32_t header = *(const uint32_t *)(object + 0x130), word = swizzledHeaderWord(header, swizzle, integerFormat(format));
+    nvPendingSwizzle.header = header;
+    nvPendingSwizzle.word = word;
+    nvPendingSwizzle.pending = YES;
+    id view = ((NewViewRangeIMP)objc_msgSend)(self, plain, format, type, levels, slices);  // nvHeaderWrite edits its header
+    BOOL edited = !nvPendingSwizzle.pending;
+    nvPendingSwizzle.pending = NO;
     const uint8_t *made = nvDriverObject(view);
-    if (!made || *(const uint32_t *)(made + 0x130) != word) {
-        if (verbose()) shimLog("[mtlshim] swizzled texture view on Kepler: the driver didn't take the swizzle: nil\n");
+    if (!edited || !made || *(const uint32_t *)(made + 0x130) != word) {
+        if (verbose()) shimLog("[mtlshim] swizzled texture view on Kepler: the header wasn't edited: nil\n");
         return nil;
     }
     Ivar stored = class_getInstanceVariable(objc_getClass("MTLIOAccelTexture"), "_swizzle");  // what -swizzle reports
@@ -4674,7 +4676,7 @@ static id nvSwizzledView(id self, MTLPixelFormat format, MTLTextureType type, NS
 static id nvSwizzleView(id self, SEL _cmd, MTLPixelFormat format, MTLTextureType type, NSRange levels, NSRange slices, MTLTextureSwizzleChannels swizzle) RETURNS_RETAINED;
 static id nvSwizzleView(id self, SEL _cmd, MTLPixelFormat format, MTLTextureType type, NSRange levels, NSRange slices, MTLTextureSwizzleChannels swizzle) {
     if (!swizzleChangesNothing(format, swizzle)) {
-        if (nvHeaderTable && !depthOrStencil(format) && !disabled("MTLSHIM_NV_SWIZZLE_VIEWS"))
+        if (origNVHeaderWrite && !depthOrStencil(format) && !disabled("MTLSHIM_NV_SWIZZLE_VIEWS"))
             return nvSwizzledView(self, format, type, levels, slices, swizzle);  // item 88
         if (verbose()) shimLog("[mtlshim] swizzled texture view on Kepler: swizzle not supported, nil\n");
         return nil;
@@ -4701,8 +4703,8 @@ static void keplerMissingMethods(void) {
     if (view.types) addMethods(texture, "Kepler texture", viewMethod, 1);
     addMethods(device, "Kepler device", icbMethod, 1);
     Dl_info driver;
-    if (dladdr((__bridge const void *)texture, &driver) && strstr(driver.dli_fname, "/GeForceMTLDriver.bundle/")) keplerHeaderTable(&driver);  // item 88
-    if (verbose()) shimLog("[mtlshim] Kepler texture header table (item 88): %s\n", nvHeaderTable ? "found" : "not found");
+    if (dladdr((__bridge const void *)texture, &driver) && strstr(driver.dli_fname, "/GeForceMTLDriver.bundle/")) keplerHeaderWriter(&driver);  // item 88
+    if (verbose()) shimLog("[mtlshim] Kepler texture header writer (item 88): %s\n", origNVHeaderWrite ? "wrapped" : "not found");
 }
 
 // 56. On the Kepler driver a view of a texture view of levels or slices 1+ dropped the first view's offset (Dawn reads
